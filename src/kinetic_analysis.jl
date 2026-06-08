@@ -8,7 +8,7 @@ Uses the simplified 2-phase upstream algorithm from the paper (Remark S2-1).
 """
 
 import Graphs
-import LinearAlgebra: norm, dot
+import LinearAlgebra: norm, dot, cholesky, Symmetric, I
 import Base.Threads
 
 # Forward declarations of types used throughout the module
@@ -180,7 +180,7 @@ function kinetic_analysis(
             # Detect ACR/ACRR using already-available network data
             # Always use efficient=true for ACR detection (faster and more complete pairwise detection)
             acr_results = _detect_acr_acrr(valid_modules, Y_matrix, metabolite_ids, complex_to_idx;
-                efficient=efficient)
+                efficient=efficient, known_acr=known_acr)
             return (
                 kinetic_modules=valid_modules,
                 acr_metabolites=acr_results.acr_metabolites,
@@ -343,9 +343,11 @@ function kinetic_analysis(
     valid_modules = filter(km -> length(km) >= min_module_size, kinetic_modules)
     sort!(valid_modules, by=length, rev=true)
 
-    # Detect ACR/ACRR using already-available network data (no redundant extraction)
+    # Detect ACR/ACRR using already-available network data (no redundant extraction).
+    # Feed the iteratively discovered ACR set so detection can propagate it
+    # (Remark S3-6): e_S ∈ im([Y∆ | e_{known ACR}]).
     acr_results = _detect_acr_acrr(valid_modules, Y_matrix, metabolite_ids, complex_to_idx;
-        efficient=efficient)
+        efficient=efficient, known_acr=collect(current_known_acr))
 
     return (
         kinetic_modules=valid_modules,
@@ -1842,7 +1844,8 @@ function _detect_acr_acrr(
     metabolite_ids::Vector{Symbol},
     complex_to_idx::Dict{Symbol,Int};
     tolerance::Float64=1e-8,
-    efficient::Bool=true
+    efficient::Bool=true,
+    known_acr::Vector{Symbol}=Symbol[]
 )
     n_metabolites = length(metabolite_ids)
 
@@ -1957,26 +1960,10 @@ function _detect_acr_acrr(
         # This finds ACR/ACRR from linear combinations of coupling relations
         Y_Delta = build_coupling_companion_matrix(kinetic_modules, Y_matrix, complex_to_idx)
 
+        # ACRR: e_i - e_j ∈ im(Y∆), from the (un-augmented) coupling span.
         if size(Y_Delta, 2) > 0
-            cache = build_cached_column_span(Y_Delta; tolerance=tolerance)
-
-            if cache.rank > 0
-                Q_reduced = cache.Q_reduced
-                coeffs = Q_reduced'
-
-                # ACR: Check if e_S ∈ im(Y∆) for each metabolite
-                for i in 1:n_metabolites
-                    coeff_col = @view coeffs[:, i]
-                    coeff_norm_sq = sum(abs2, coeff_col)
-                    proj_diag = sum(Q_reduced[i, k] * coeff_col[k] for k in 1:cache.rank)
-                    residual_norm_sq = coeff_norm_sq - 2 * proj_diag + 1.0
-
-                    if residual_norm_sq < tolerance^2
-                        push!(acr_set, metabolite_ids[i])
-                    end
-                end
-
-                # ACRR: Check if e_i - e_j ∈ im(Y∆) for each metabolite pair
+            base_cache = build_cached_column_span(Y_Delta; tolerance=tolerance)
+            if base_cache.rank > 0
                 diff_vec = zeros(Float64, n_metabolites)
                 for i in 1:n_metabolites
                     for j in (i+1):n_metabolites
@@ -1984,13 +1971,45 @@ function _detect_acr_acrr(
                         diff_vec[i] = 1.0
                         diff_vec[j] = -1.0
 
-                        if is_in_span(diff_vec, cache)
+                        if is_in_span(diff_vec, base_cache)
                             m1, m2 = metabolite_ids[i], metabolite_ids[j]
                             push!(acrr_set, m1 < m2 ? (m1, m2) : (m2, m1))
                         end
                     end
                 end
             end
+        end
+
+        # ACR with iterative known-ACR augmentation (Remark S3-6 propagation):
+        # metabolite S is ACR if e_S ∈ im([Y∆ | e_{known ACR}]). Each newly
+        # resolved metabolite is fed back as a column and the span re-checked
+        # until a fixed point, so an externally known ACR (or one found in this
+        # pass) can unlock further ACR through any coupling monomial. With no
+        # external known_acr this reduces to the plain e_S ∈ im(Y∆) check.
+        known = Set{Symbol}(known_acr)
+        union!(known, acr_set)  # seed with pairwise-detected ACR (Part 1)
+        e_vec = zeros(Float64, n_metabolites)
+        Y_Delta_dense = Matrix{Float64}(Y_Delta)
+        while true
+            aug = build_acr_augmentation(collect(known), metabolite_ids, n_metabolites)
+            Y_aug = size(aug, 2) > 0 ? hcat(Y_Delta_dense, aug) : Y_Delta_dense
+            size(Y_aug, 2) == 0 && break
+
+            cache = build_cached_column_span(Y_aug; tolerance=tolerance)
+            cache.rank == 0 && break
+
+            newly = Symbol[]
+            for i in 1:n_metabolites
+                metabolite_ids[i] in known && continue
+                fill!(e_vec, 0.0)
+                e_vec[i] = 1.0
+                if is_in_span(e_vec, cache)
+                    push!(newly, metabolite_ids[i])
+                end
+            end
+            isempty(newly) && break
+            union!(acr_set, newly)
+            union!(known, newly)
         end
 
         return (acr_metabolites=collect(acr_set), acrr_pairs=collect(acrr_set))
@@ -2034,14 +2053,196 @@ function identify_acr_acrr(
     kinetic_modules::Vector{Set{Symbol}},
     model::A.AbstractFBCModel;
     tolerance::Float64=1e-8,
-    efficient::Bool=true
+    efficient::Bool=true,
+    known_acr::Vector{Symbol}=Symbol[]
 )
     # Extract network topology and delegate to helper
     Y_matrix, metabolite_ids, complex_ids = complex_stoichiometry(model; return_ids=true)
     complex_to_idx = Dict{Symbol,Int}(id => i for (i, id) in enumerate(complex_ids))
 
     return _detect_acr_acrr(kinetic_modules, Y_matrix, metabolite_ids, complex_to_idx;
-        tolerance=tolerance, efficient=efficient)
+        tolerance=tolerance, efficient=efficient, known_acr=known_acr)
+end
+
+"""
+    identify_acr_acrr_dce(model; tolerance=1e-7, known_acr=Symbol[])
+
+Identify ACR/ACRR via the flux-coupling (DCE) criterion — an extension of the
+graph-based kinetic-module analysis that also captures robustness arising from
+couplings *across* linkage classes.
+
+Every mass-action flux is `v_r = k_r · ψ(σ(r))`, the monomial of its substrate
+complex `σ(r)`. Reactions that are fully coupled (constant flux ratio at every
+steady state) therefore impose a constant monomial ratio
+`ψ(σ(i)) / ψ(σ(j)) = const`, so the substrate-complex composition difference
+`Y[:,σ(i)] − Y[:,σ(j)]` is a constant-log-monomial direction. Collecting these
+into a matrix `M`:
+- metabolite `S` has ACR  iff `e_S ∈ im(M)`;
+- metabolites `S1,S2` have ACRR iff `e_{S1} − e_{S2} ∈ im(M)`.
+
+Full flux coupling is detected structurally as parallel (positive-scale) rows of a
+null-space basis of the stoichiometric matrix `N` (i.e. `vᵢ/vⱼ` constant over
+`ker N`). `known_acr` metabolites are augmented into the span (propagation, Remark
+S3-6) and the ACR check is iterated to a fixed point.
+
+Unlike [`identify_acr_acrr`](@ref), which detects ACR/ACRR only within graph-connected
+kinetic modules, this method recovers `[D]`/`[B]`-type robustness that the upstream
+algorithm splits across linkage classes.
+
+!!! note
+    Uses a dense null space of `N` and an `O(n_reactions²)` coupling scan; intended for
+    chemical-reaction networks where cross-linkage robustness matters, not genome-scale models.
+
+# Returns
+Named tuple `(acr_metabolites::Vector{Symbol}, acrr_pairs::Vector{Tuple{Symbol,Symbol}})`.
+"""
+function identify_acr_acrr_dce(
+    model::A.AbstractFBCModel;
+    tolerance::Float64=1e-7,
+    known_acr::Vector{Symbol}=Symbol[],
+    n_probes::Int=8,
+    seed::Integer=1234,
+)
+    N = SparseArrays.SparseMatrixCSC{Float64,Int}(A.stoichiometry(model))  # metabolites × reactions (sparse)
+    A_mat, _ = incidence(model; return_ids=true)
+    Y_matrix, metabolite_ids, _ = complex_stoichiometry(model; return_ids=true)
+    n_rxn = size(N, 2)
+    n_met = length(metabolite_ids)
+    empty_result = (acr_metabolites=Symbol[], acrr_pairs=Tuple{Symbol,Symbol}[])
+    (n_rxn == 0 || n_met == 0) && return empty_result
+
+    # Substrate complex (incidence entry −1) for each reaction.
+    substrate = zeros(Int, n_rxn)
+    arows = SparseArrays.rowvals(A_mat)
+    avals = SparseArrays.nonzeros(A_mat)
+    for r in 1:n_rxn
+        for k in SparseArrays.nzrange(A_mat, r)
+            avals[k] < 0 && (substrate[r] = arows[k])
+        end
+    end
+
+    # --- Scalable full flux coupling ------------------------------------------------
+    # Reactions i,j are fully coupled iff vᵢ/vⱼ is constant over ker N, i.e. their rows
+    # in any null-space basis are parallel. Rather than materialise a (dense, possibly
+    # huge) null-space, we fingerprint each reaction with its values on a few random
+    # vectors sampled from ker N; coupled reactions get parallel fingerprints. Sampling
+    # ker N is one sparse normal-equation solve per probe: v = w − Nᵀ(NNᵀ)⁺(N w), using
+    # a single sparse Cholesky factorisation of NNᵀ+εI. Cost: O(n_probes) sparse solves
+    # + O(n_reactions·n_probes) grouping — no dense null space, no O(n_reactions²) scan.
+    Nt = SparseArrays.sparse(transpose(N))
+    NNt = N * Nt
+    scale = isempty(SparseArrays.nonzeros(NNt)) ? 1.0 : maximum(abs, SparseArrays.nonzeros(NNt))
+    F = cholesky(Symmetric(NNt + (1e-9 * scale) * I))
+    rng = StableRNGs.StableRNG(seed)
+    t = clamp(n_probes, 1, n_rxn)
+    G = Matrix{Float64}(undef, n_rxn, t)
+    for k in 1:t
+        w = randn(rng, n_rxn)
+        G[:, k] = w .- Nt * (F \ (N * w))            # projection of w onto ≈ ker N
+    end
+
+    # Group reactions into coupling classes by parallel (positive-scaled) fingerprint.
+    classkey = f -> begin
+        nf = norm(f)
+        nf < tolerance && return nothing             # blocked / inactive in ker N
+        u = f ./ nf
+        i0 = findfirst(x -> abs(x) > 1e-8, u)
+        i0 !== nothing && u[i0] < 0 && (u = -u)       # canonical sign
+        Tuple(round.(u; digits=6))
+    end
+    classes = Dict{Any,Vector{Int}}()
+    for r in 1:n_rxn
+        key = classkey(@view G[r, :])
+        key === nothing && continue
+        push!(get!(classes, key, Int[]), r)
+    end
+
+    # Coupling-difference directions: within each class, Y[:,σ(ref)] − Y[:,σ(r)].
+    diff_cols = Vector{SparseArrays.SparseVector{Float64,Int}}()
+    seen = Set{Vector{Pair{Int,Float64}}}()
+    for rxns in values(classes)
+        length(rxns) < 2 && continue
+        ref = findfirst(r -> substrate[r] != 0, rxns)
+        ref === nothing && continue
+        yref = Y_matrix[:, substrate[rxns[ref]]]
+        for r in rxns
+            (r == rxns[ref] || substrate[r] == 0) && continue
+            d = yref - Y_matrix[:, substrate[r]]
+            SparseArrays.nnz(d) == 0 && continue
+            sig = [i => d[i] for i in SparseArrays.findnz(d)[1]]
+            sig in seen && continue
+            push!(seen, sig)
+            push!(diff_cols, d)
+        end
+    end
+
+    # --- ACR/ACRR in the reduced space of metabolites that actually appear ----------
+    met_to_idx = Dict(id => i for (i, id) in enumerate(metabolite_ids))
+    active = Set{Int}()
+    for d in diff_cols, i in SparseArrays.findnz(d)[1]
+        push!(active, i)
+    end
+    for s in known_acr
+        haskey(met_to_idx, s) && push!(active, met_to_idx[s])
+    end
+    isempty(active) && return empty_result
+    act = sort(collect(active))
+    na = length(act)
+    pos = Dict(act[i] => i for i in 1:na)
+
+    M = zeros(Float64, na, length(diff_cols))
+    for (j, d) in enumerate(diff_cols)
+        idxs, vals = SparseArrays.findnz(d)
+        for (i, v) in zip(idxs, vals)
+            M[pos[i], j] = v
+        end
+    end
+
+    acr_idx = Set{Int}()
+    acrr_set = Set{Tuple{Symbol,Symbol}}()
+
+    if size(M, 2) > 0
+        base = build_cached_column_span(M; tolerance=tolerance)
+        if base.rank > 0
+            d = zeros(Float64, na)
+            for a in 1:na, b in (a+1):na
+                fill!(d, 0.0); d[a] = 1.0; d[b] = -1.0
+                if is_in_span(d, base)
+                    m1, m2 = metabolite_ids[act[a]], metabolite_ids[act[b]]
+                    push!(acrr_set, m1 < m2 ? (m1, m2) : (m2, m1))
+                end
+            end
+        end
+    end
+
+    # ACR with iterative known-ACR augmentation (propagation, Remark S3-6).
+    known = Set{Int}(pos[met_to_idx[s]] for s in known_acr if haskey(met_to_idx, s) && haskey(pos, met_to_idx[s]))
+    e = zeros(Float64, na)
+    while true
+        if isempty(known)
+            M_aug = M
+        else
+            aug = zeros(Float64, na, length(known))
+            for (c, p) in enumerate(known); aug[p, c] = 1.0; end
+            M_aug = hcat(M, aug)
+        end
+        size(M_aug, 2) == 0 && break
+        cache = build_cached_column_span(M_aug; tolerance=tolerance)
+        cache.rank == 0 && break
+        newly = Int[]
+        for a in 1:na
+            a in known && continue
+            fill!(e, 0.0); e[a] = 1.0
+            is_in_span(e, cache) && push!(newly, a)
+        end
+        isempty(newly) && break
+        union!(acr_idx, newly); union!(known, newly)
+    end
+
+    return (
+        acr_metabolites=[metabolite_ids[act[a]] for a in acr_idx],
+        acrr_pairs=collect(acrr_set),
+    )
 end
 
 """

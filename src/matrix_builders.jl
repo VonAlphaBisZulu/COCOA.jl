@@ -26,6 +26,18 @@ efficient sparse matrix construction, and AbstractFBCModels.jl for model interfa
 # ========================================================================================
 
 """
+    has_explicit_complexes(model) -> Bool
+
+Whether `model` carries an explicit complex decomposition (substrate/product complex
+per reaction) that overrides the net-stoichiometry-based complex reconstruction.
+
+Net stoichiometry cannot represent a species appearing on both sides of a reaction
+(e.g. autocatalysis `A + D -> 2A`), so such networks must supply complexes explicitly.
+Defaults to `false`; models providing explicit complexes specialise this to `true`.
+"""
+has_explicit_complexes(::Any) = false
+
+"""
     _extract_complexes_from_model(model::A.AbstractFBCModel)
 
 Extract unique complexes directly from model reactions without building constraints.
@@ -422,6 +434,14 @@ Y, metabolites, complexes = complex_stoichiometry(constraints; return_ids=true)
 ```
 """
 function complex_stoichiometry(constraints::C.ConstraintTree; return_ids::Bool=false, model::Union{A.AbstractFBCModel,Nothing}=nothing)
+    # Models that carry an explicit complex decomposition (e.g. autocatalytic CRNs
+    # where a species appears on both sides) cannot have their complexes recovered
+    # from the net stoichiometry encoded in the constraint tree. Defer to the
+    # model-based extraction, which honours the explicit complexes.
+    if model !== nothing && has_explicit_complexes(model)
+        return complex_stoichiometry(model; return_ids=return_ids)
+    end
+
     # Extract complexes using the shared function
     complex_info, _ = extract_complexes(constraints)
 

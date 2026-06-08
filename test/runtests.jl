@@ -436,3 +436,6 @@ end # end of testset "COCOA.jl - EnvZ-OmpR Paper Validation"
 
 # Run the stricter paper example validation suite as part of default tests.
 include("test_kinetic_analysis.jl")
+
+# Flux-coupling (DCE) ACR/ACRR detector regression tests.
+include("test_dce_acr.jl")
