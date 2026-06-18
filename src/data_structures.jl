@@ -884,7 +884,10 @@ function to_namedtuple(results::ConcordanceResults; detailed::Bool=false)
         #   Balanced (3)            ↔  CC(i,i) =  1  (balanced, diagonal)
         #   Trivially_balanced (4)  ↔  CC(i,i) =  1  (trivially balanced, diagonal)
         let mat = results.concordance_matrix
-            ci_rows, ci_cols, ci_vals = SparseArrays.findnz(mat)
+            # `findnz` has no method for UpperTriangular{…,SparseMatrixCSC} on
+            # current SparseArrays; materialize the triangular view to a plain
+            # SparseMatrixCSC first (preserves only the upper-triangular entries).
+            ci_rows, ci_cols, ci_vals = SparseArrays.findnz(SparseArrays.sparse(mat))
             n_cx_pairs = length(ci_rows)
             cp_c1 = Vector{String}(undef, n_cx_pairs)
             cp_c2 = Vector{String}(undef, n_cx_pairs)
